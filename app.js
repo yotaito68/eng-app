@@ -182,7 +182,9 @@ const Rec = {
       let o = 0; for (const c of this.chunks) { all.set(c, o); o += c.length; }
       rate = this.rate;
     }
-    const pcm = downsample(all, rate, 16000);
+    let pcm = downsample(all, rate, 16000);
+    const span = voicedSpan(pcm, 16000);
+    if (span) pcm = pcm.subarray(Math.max(0, span[0] - 4800), Math.min(pcm.length, span[1] + 4800)); // keep 0.3 s around speech
     const out = { wav: encodeWav(pcm, 16000), voiced: voicedSeconds(pcm, 16000), total: pcm.length / 16000, elapsed };
     if (out.total < 0.3) this.release();             // nothing captured → get a fresh microphone next time
     return out;
@@ -215,6 +217,15 @@ function voicedSeconds(pcm, rate) {
   let a = rms.findIndex(v => v > thr), b = rms.length - 1 - rms.slice().reverse().findIndex(v => v > thr);
   if (a < 0) return 0;
   return (b - a + 1) * 0.02;
+}
+function voicedSpan(pcm, rate) {
+  const f = Math.floor(rate * 0.02), rms = [];
+  for (let i = 0; i + f <= pcm.length; i += f) { let s = 0; for (let j = i; j < i + f; j++) s += pcm[j] * pcm[j]; rms.push(Math.sqrt(s / f)); }
+  if (!rms.length) return null;
+  const so = rms.slice().sort((a, b) => a - b), thr = Math.max(0.008, so[Math.floor(so.length * 0.1)] * 3, so[so.length - 1] * 0.08);
+  const a = rms.findIndex(v => v > thr); if (a < 0) return null;
+  let b = rms.length - 1; while (b > a && rms[b] <= thr) b--;
+  return [a * f, (b + 1) * f];
 }
 function encodeWav(pcm, rate) {
   const buf = new ArrayBuffer(44 + pcm.length * 2), v = new DataView(buf);
@@ -353,6 +364,99 @@ async function gemini(parts, schema, opt = {}) {
   throw lastErr || new ApiError('AIの呼び出しに失敗しました', 0);
 }
 
+// ---------- fast grading: streaming + a backup request when the first model is slow ----------
+const HEDGE_MS = 3000, RACE_TIMEOUT_MS = 15000;
+async function streamOne(model, parts, schema, ctl, onText) {
+  const key = S.settings.apiKey, g3 = !/gemini-[12]\./.test(model), noThink = (S.settings.noThink || {})[model];
+  const gc = { responseMimeType: 'application/json', responseSchema: schema };
+  if (!g3) gc.temperature = 0.2;
+  if (!noThink) gc.thinkingConfig = g3 ? { thinkingLevel: 'minimal' } : { thinkingBudget: 0 };
+  const r = await fetch(`${API}/models/${model}:streamGenerateContent?alt=sse`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, signal: ctl.signal,
+    body: JSON.stringify({ contents: [{ role: 'user', parts }], generationConfig: gc })
+  });
+  if (!r.ok) {
+    const info = await errInfo(r), err = new ApiError(info.msg, r.status);
+    if (r.status === 400 && !noThink && /think/i.test(info.msg)) { // remember and retry without the setting
+      S.settings.noThink = Object.assign(S.settings.noThink || {}, { [model]: true }); save();
+      return streamOne(model, parts, schema, ctl, onText);
+    }
+    if (r.status === 429) { if (info.perDay && !info.perMin) { markOut(model); err.perDay = true; } else err.perMin = true; }
+    if ((r.status === 400 && /API key/i.test(info.msg)) || r.status === 401 || r.status === 403) err.fatal = true;
+    throw err;
+  }
+  const reader = r.body.getReader(), dec = new TextDecoder();
+  let buf = '', text = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+      if (!line.startsWith('data:')) continue;
+      try {
+        const d = JSON.parse(line.slice(5));
+        const t = (d.candidates?.[0]?.content?.parts || []).filter(p => p.text && !p.thought).map(p => p.text).join('');
+        if (t) { text += t; onText(text); }
+      } catch (e) {}
+    }
+  }
+  if (!text) throw new ApiError('AIから空の応答が返りました。', 200);
+  return text;
+}
+function raceError(errs) {
+  const f = errs.find(e => e.fatal);
+  if (f) return new ApiError(/API key/i.test(f.message) ? 'APIキーが正しくないようです。設定を確認してください。' : 'APIキーが使えません（' + f.message + '）', f.status);
+  if (errs.length && errs.every(e => e.perDay)) return new ApiError('今日の無料枠をすべて使い切りました。日本時間の17時ごろ（夏は16時ごろ）に回復します。', 429);
+  if (errs.some(e => e.perMin)) return new ApiError('短時間に使いすぎたため一時的に止まっています。30秒ほど待ってから再送信してください。', 429);
+  if (navigator.onLine === false) return new ApiError('オフラインです。電波が戻ったら再送信してください。', 0);
+  return new ApiError('AIとの通信がうまくいきませんでした。もう一度「再送信」を押してください。', 0);
+}
+// Ask the fastest model; if it hasn't started answering within 3 s, ask a second model in parallel and keep whichever answers first.
+function geminiRace(parts, schema, onText) {
+  if (!S.settings.apiKey) return Promise.reject(new ApiError('APIキーが未設定です。設定タブで入力してください。', 0));
+  const order = modelOrder().slice(0, 3);
+  if (!order.length) return Promise.reject(raceError([{ perDay: true }]));
+  return new Promise((resolve, reject) => {
+    const ctls = [], errs = [];
+    let next = 0, running = 0, leader = null, finished = false, hedge, overall;
+    const end = () => { finished = true; clearTimeout(hedge); clearTimeout(overall); };
+    const launch = () => {
+      const model = order[next++], ctl = new AbortController(); ctls.push(ctl); running++;
+      streamOne(model, parts, schema, ctl, text => {
+        if (finished) return;
+        if (!leader) { leader = ctl; clearTimeout(hedge); ctls.forEach(c => c !== ctl && c.abort()); }
+        if (leader === ctl) onText(text);
+      }).then(text => {
+        if (finished || (leader && leader !== ctl)) return;
+        end(); countUse(model);
+        if (!S.settings.modelPinned && S.settings.model !== model) S.settings.model = model;
+        save();
+        try { resolve({ json: JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, '')), model }); }
+        catch (e) { reject(new ApiError('AIの応答を読み取れませんでした。もう一度「再送信」を押してください。', 200)); }
+      }).catch(err => {
+        running--;
+        if (finished || err.name === 'AbortError' || (leader && leader !== ctl)) return;
+        errs.push(err);
+        if (leader === ctl) leader = null;
+        if (!err.fatal && next < order.length) return launch();
+        if (running === 0) { end(); reject(raceError(errs)); }
+      });
+    };
+    launch();
+    hedge = setTimeout(() => { if (!leader && !finished && next < order.length) launch(); }, HEDGE_MS);
+    overall = setTimeout(() => { if (finished) return; end(); ctls.forEach(c => c.abort()); reject(new ApiError('AIの応答に時間がかかりすぎました。もう一度「再送信」を押してください。', 408)); }, RACE_TIMEOUT_MS);
+    curCtl = { abort() { if (finished) return; end(); ctls.forEach(c => c.abort()); reject(new ApiError('中止しました', -1)); } };
+  });
+}
+// pull finished fields out of a JSON answer that is still streaming in
+function partialFields(t) {
+  const str = k => { const m = t.match(new RegExp('"' + k + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"')); if (!m) return null; try { return JSON.parse('"' + m[1] + '"'); } catch (e) { return null; } };
+  const sc = t.match(/"score"\s*:\s*(\d+)/), co = t.match(/"correct"\s*:\s*(true|false)/);
+  return { transcript: str('transcript'), score: sc ? Number(sc[1]) : null, correct: co ? co[1] === 'true' : null };
+}
+
 const GRADE_SCHEMA = {
   type: 'OBJECT',
   properties: {
@@ -365,6 +469,7 @@ const GRADE_SCHEMA = {
     errors: { type: 'ARRAY', items: { type: 'OBJECT', properties: { wrong: { type: 'STRING' }, right: { type: 'STRING' }, why_ja: { type: 'STRING' } }, required: ['wrong', 'right', 'why_ja'] } },
     correct_lemmas: { type: 'ARRAY', items: { type: 'STRING' } }
   },
+  propertyOrdering: ['transcript', 'correct', 'score', 'corrected', 'natural', 'feedback_ja', 'errors', 'correct_lemmas'],
   required: ['transcript', 'score', 'correct', 'corrected', 'natural', 'feedback_ja', 'errors', 'correct_lemmas']
 };
 function gradePrompt(s, typed) {
@@ -389,7 +494,7 @@ const norm = t => String(t).toLowerCase().replace(/[’']/g, "'").replace(/[^a-z
 function tidy(t) {
   return String(t).trim().replace(/\bi\b(?=[\s',.!?]|$)/g, 'I').replace(/^([^A-Za-z]*)([a-z])/, (m, p, c) => p + c.toUpperCase());
 }
-async function grade(s, wav, typed) {
+async function grade(s, wav, typed, onPartial) {
   if (typed) typed = tidy(typed);
   // exact match with the model answer → instant result, no AI call
   if (typed && norm(typed) === norm(s.en)) {
@@ -397,7 +502,7 @@ async function grade(s, wav, typed) {
   }
   const parts = [{ text: gradePrompt(s, typed) }];
   if (!typed) parts.push({ inlineData: { mimeType: 'audio/wav', data: b64(wav) } });
-  const r = await gemini(parts, GRADE_SCHEMA, { temperature: 0.2 });
+  const { json: r } = await geminiRace(parts, GRADE_SCHEMA, t => onPartial && onPartial(partialFields(t)));
   r.score = clamp(Math.round(Number(r.score) || 0), 0, 100);
   r.correct = r.correct === true || r.correct === 'true';
   // drop "errors" that are only about capitalization or punctuation
@@ -698,7 +803,7 @@ function backIndex() {
 function drawAnswerArea(mode) {
   const box = $('#ans');
   if (P.state === 'busy') {
-    box.innerHTML = `<div class="center" style="padding:20px"><span class="spin"></span><p class="sub">採点中… <span class="timer" id="bt">0.0秒</span></p><button class="ghost" id="cancel">やめる</button></div>`;
+    box.innerHTML = `<div id="partial"></div><div class="center" style="padding:14px 0 4px"><span class="spin"></span><p class="sub">採点中… <span class="timer" id="bt">0.0秒</span></p><button class="ghost" id="cancel">やめる</button></div>`;
     const t0 = Date.now();
     clearInterval(drawAnswerArea._t);
     drawAnswerArea._t = setInterval(() => { const e = $('#bt'); if (!e || P.state !== 'busy') return clearInterval(drawAnswerArea._t); e.textContent = ((Date.now() - t0) / 1000).toFixed(1) + '秒'; }, 100);
@@ -771,7 +876,15 @@ async function submit(audio, typed, passed) {
   if (passed) {
     res = { transcript: '', score: 0, correct: false, corrected: s.en, natural: s.en, feedback_ja: ['パスしました。模範解答を声に出して何度か言ってみましょう。'], errors: [], correct_lemmas: [] };
   } else {
-    try { res = await grade(s, audio && audio.wav, typed); }
+    const t0 = performance.now();
+    try {
+      res = await grade(s, audio && audio.wav, typed, pf => {
+        const el = $('#partial'); if (!el || P !== myP) return;
+        el.innerHTML = `${pf.score != null || pf.correct != null ? `<div class="row" style="margin-top:8px">${pf.score != null ? `<span class="score ${scoreClass(pf.score)}" style="font-size:32px">${pf.score}</span>` : ''}${pf.correct != null ? `<span class="chip ${pf.correct ? '' : 'gray'}" style="margin-left:8px">${pf.correct ? '✓ 正解' : '✗ 不正解'}</span>` : ''}</div>` : ''}
+          ${pf.transcript != null ? `<div class="lbl">あなたの回答</div><div class="en">${esc(pf.transcript) || '<span class="sub">（聞き取れませんでした）</span>'}</div>` : ''}`;
+      });
+      myP.secs = (performance.now() - t0) / 1000;
+    }
     catch (e) {
       // keep the answer so it can be resent (e.g. no signal in a tunnel)
       myP.state = 'ask'; myP.pending = { audio, typed };
@@ -824,7 +937,7 @@ function resultCardHTML(s, r, meta) {
   const sameAsCorrected = norm(res.corrected || '') === norm(res.transcript || '');
   items.push(`<div class="row"><div class="score ${scoreClass(res.score)}">${res.score}</div><div class="sub">/100</div>
     ${res.correct != null ? `<span class="chip ${res.correct ? '' : 'gray'}" style="margin-left:8px">${res.correct ? '✓ 正解' : '✗ 不正解'}</span>` : ''}<span class="spacer"></span>
-    <div style="text-align:right" class="sub">${r.wpm ? `話す速さ <b>${r.wpm}</b> 語/分<br>` : ''}${r.rt != null ? `反応 ${r.rt.toFixed(1)}秒` : ''}${meta.showDelta && r.delta ? `<br>レベル ${r.delta > 0 ? '+' : ''}${r.delta.toFixed(2)}` : ''}</div></div>`);
+    <div style="text-align:right" class="sub">${r.wpm ? `話す速さ <b>${r.wpm}</b> 語/分<br>` : ''}${r.rt != null ? `反応 ${r.rt.toFixed(1)}秒` : ''}${meta.showDelta && r.delta ? `<br>レベル ${r.delta > 0 ? '+' : ''}${r.delta.toFixed(2)}` : ''}${r.secs ? `<br>採点 ${r.secs.toFixed(1)}秒` : ''}</div></div>`);
   items.push(`<div class="lbl">あなたの回答</div><div class="en">${res.transcript ? esc(res.transcript) : '<span class="sub">（なし）</span>'}</div>`);
   if (res.transcript && !sameAsCorrected) items.push(`<div class="lbl">直すなら</div><div class="say"><div class="en good">${esc(res.corrected)}</div><button class="spk" data-say="${esc(res.corrected)}">▶</button></div>`);
   if (res.feedback_ja?.length) items.push(`<ul class="fb">${res.feedback_ja.map(f => `<li>${esc(f)}</li>`).join('')}</ul>`);

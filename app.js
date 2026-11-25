@@ -123,31 +123,69 @@ function pickFallback(excludeId, exclude = new Set()) {
 }
 
 // ---------- recording (PCM → WAV) ----------
+// Recorder. iPhone Safari is unreliable with the old ScriptProcessor capture (it can deliver no audio at all),
+// so MediaRecorder is used first and its file is decoded to PCM; ScriptProcessor stays as a fallback.
 const Rec = {
-  stream: null, ctx: null, node: null, src: null, chunks: [], rate: 44100, on: false, t0: 0,
+  stream: null, ctx: null, node: null, src: null, chunks: [], blobs: [], mr: null, rate: 44100, on: false, t0: 0, mode: '',
+  getCtx() {
+    if (!this.ctx || this.ctx.state === 'closed') this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    return this.ctx;
+  },
+  liveStream() {
+    const t = this.stream && this.stream.getAudioTracks()[0];
+    return t && t.readyState === 'live' && !t.muted;
+  },
   async ensure() {
-    if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)();
-    if (this.ctx.state === 'suspended') await this.ctx.resume();
-    if (!this.stream || !this.stream.active) {
+    if (!this.liveStream()) {
+      this.release();
       this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 } });
     }
   },
   async start() {
+    if ('speechSynthesis' in window) speechSynthesis.cancel();
+    const ctx = this.getCtx();                       // create/resume inside the tap (iOS needs a user gesture)
+    if (ctx.state !== 'running') { try { await ctx.resume(); } catch (e) {} }
     await this.ensure();
-    this.rate = this.ctx.sampleRate; this.chunks = [];
-    this.src = this.ctx.createMediaStreamSource(this.stream);
-    this.node = this.ctx.createScriptProcessor(4096, 1, 1);
-    this.node.onaudioprocess = e => { if (this.on) this.chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
-    this.src.connect(this.node); this.node.connect(this.ctx.destination);
+    this.chunks = []; this.blobs = [];
+    if (window.MediaRecorder) {
+      const type = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'].find(t => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t));
+      this.mr = new MediaRecorder(this.stream, type ? { mimeType: type } : undefined);
+      this.mr.ondataavailable = e => { if (e.data && e.data.size) this.blobs.push(e.data); };
+      this.mr.start(250);
+      this.mode = 'mr';
+    } else {
+      this.rate = ctx.sampleRate;
+      this.src = ctx.createMediaStreamSource(this.stream);
+      this.node = ctx.createScriptProcessor(4096, 1, 1);
+      this.node.onaudioprocess = e => { if (this.on) this.chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+      this.src.connect(this.node); this.node.connect(ctx.destination);
+      this.mode = 'sp';
+    }
     this.on = true; this.t0 = performance.now();
   },
-  stop() {
+  async stop() {
     this.on = false;
-    try { this.src.disconnect(); this.node.disconnect(); } catch (e) {}
-    const len = this.chunks.reduce((a, c) => a + c.length, 0), all = new Float32Array(len);
-    let o = 0; for (const c of this.chunks) { all.set(c, o); o += c.length; }
-    const pcm = downsample(all, this.rate, 16000);
-    return { wav: encodeWav(pcm, 16000), voiced: voicedSeconds(pcm, 16000), total: pcm.length / 16000 };
+    const elapsed = (performance.now() - this.t0) / 1000;
+    let all = new Float32Array(0), rate = 16000;
+    if (this.mode === 'mr') {
+      const mr = this.mr;
+      await new Promise(ok => { mr.onstop = ok; try { mr.stop(); } catch (e) { ok(); } });
+      const blob = new Blob(this.blobs, { type: mr.mimeType || 'audio/mp4' });
+      try {
+        const buf = await blob.arrayBuffer(), ctx = this.getCtx();
+        const ab = await new Promise((ok, ng) => { const p = ctx.decodeAudioData(buf, ok, ng); if (p && p.then) p.then(ok, ng); });
+        all = ab.getChannelData(0); rate = ab.sampleRate;
+      } catch (e) { all = new Float32Array(0); }
+    } else {
+      try { this.src.disconnect(); this.node.disconnect(); } catch (e) {}
+      const len = this.chunks.reduce((a, c) => a + c.length, 0); all = new Float32Array(len);
+      let o = 0; for (const c of this.chunks) { all.set(c, o); o += c.length; }
+      rate = this.rate;
+    }
+    const pcm = downsample(all, rate, 16000);
+    const out = { wav: encodeWav(pcm, 16000), voiced: voicedSeconds(pcm, 16000), total: pcm.length / 16000, elapsed };
+    if (out.total < 0.3) this.release();             // nothing captured → get a fresh microphone next time
+    return out;
   },
   release() {
     if (this.stream) this.stream.getTracks().forEach(t => t.stop());
@@ -706,8 +744,13 @@ async function toggleRec() {
     }, 100);
   } else {
     clearInterval(recTimer);
-    const out = Rec.stop();
-    if (out.total < 0.4) { toast('短すぎました。もう一度どうぞ'); drawAnswerArea('voice'); return; }
+    mic.disabled = true;
+    const out = await Rec.stop();
+    if (out.total < 0.4) {
+      if (out.elapsed >= 1) toast('音声を録音できませんでした。もう一度試してください。続く場合はアプリを開き直すか、キーボードで答えてください。', 5000);
+      else toast('短すぎました。もう一度どうぞ');
+      drawAnswerArea('voice'); return;
+    }
     submit(out, null);
   }
 }

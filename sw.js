@@ -1,5 +1,5 @@
 // Offline cache for the app shell. Bump VERSION when you change any file.
-const VERSION = 'v7';
+const VERSION = 'v8';
 const FILES = ['./', 'index.html', 'style.css', 'app.js', 'words2000.js', 'sentences.js', 'manifest.json', 'icon-180.png', 'icon-512.png'];
 self.addEventListener('install', e => {
   // cache:'reload' skips the browser's HTTP cache so a fresh copy is stored

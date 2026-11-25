@@ -26,7 +26,8 @@ function defaultState() {
     items: {},           // id -> {n, t, s, st, due, rev}
     generated: [],       // AI-generated sentences
     history: [],         // {t,id,s,wpm,rt,lv}
-    qCount: 0
+    qCount: 0,
+    session: null
   };
 }
 let S = load();
@@ -79,7 +80,7 @@ function updateRating(L, score, wpm, K) {
 }
 
 // ---------- question selection ----------
-function sceneOk(x) { return !S.settings.scenes.length || S.settings.scenes.includes(x.sc); }
+function sceneOk(x) { return true; }
 function dueReviews() {
   const now = Date.now();
   return allSentences().filter(x => { const it = S.items[x.id]; return it && it.rev && it.due <= now; })
@@ -97,12 +98,12 @@ function pickPlacement() {
 }
 
 // returns {s: sentence, review: bool} or null if AI generation is needed
-function pickNext(excludeId) {
-  const due = dueReviews().filter(x => x.id !== excludeId);
+function pickNext(exclude = new Set()) {
+  const due = dueReviews().filter(x => !exclude.has(x.id));
   if (due.length && (S.qCount % 2 === 0 || due.length > 8)) return { s: due[0], review: true };
   const target = (S.rating ?? 4.5) + 0.4;
   const recent = recentIds(25);
-  const cands = allSentences().filter(x => sceneOk(x) && x.id !== excludeId && !recent.has(x.id) && Math.abs(x.lv - target) <= 1.6);
+  const cands = allSentences().filter(x => sceneOk(x) && !exclude.has(x.id) && !recent.has(x.id) && Math.abs(x.lv - target) <= 1.6);
   const unseen = cands.filter(x => !S.items[x.id]);
   if (unseen.length) {
     let best = null, bv = -1e9;
@@ -114,9 +115,9 @@ function pickNext(excludeId) {
   }
   return null; // run out → generate new sentences
 }
-function pickFallback(excludeId) {
+function pickFallback(excludeId, exclude = new Set()) {
   const target = (S.rating ?? 4.5) + 0.4;
-  const c = allSentences().filter(x => sceneOk(x) && x.id !== excludeId && Math.abs(x.lv - target) <= 1.6)
+  const c = allSentences().filter(x => sceneOk(x) && x.id !== excludeId && !exclude.has(x.id) && Math.abs(x.lv - target) <= 1.6)
     .sort((a, b) => (S.items[a.id]?.t || 0) - (S.items[b.id]?.t || 0));
   return c[0] || SENTENCES[0];
 }
@@ -292,13 +293,14 @@ const GRADE_SCHEMA = {
   properties: {
     transcript: { type: 'STRING' },
     score: { type: 'INTEGER' },
+    correct: { type: 'BOOLEAN' },
     corrected: { type: 'STRING' },
     natural: { type: 'STRING' },
     feedback_ja: { type: 'ARRAY', items: { type: 'STRING' } },
     errors: { type: 'ARRAY', items: { type: 'OBJECT', properties: { wrong: { type: 'STRING' }, right: { type: 'STRING' }, why_ja: { type: 'STRING' } }, required: ['wrong', 'right', 'why_ja'] } },
     correct_lemmas: { type: 'ARRAY', items: { type: 'STRING' } }
   },
-  required: ['transcript', 'score', 'corrected', 'natural', 'feedback_ja', 'errors', 'correct_lemmas']
+  required: ['transcript', 'score', 'correct', 'corrected', 'natural', 'feedback_ja', 'errors', 'correct_lemmas']
 };
 function gradePrompt(s, typed) {
   return `You are an English speaking coach for a Japanese learner doing "瞬間英作文" (instant translation practice).
@@ -310,6 +312,7 @@ Be brief — speed matters. Reply in JSON:
 1. transcript: ${typed ? 'copy the learner\'s text as is.' : 'transcribe exactly what the learner said in English, verbatim, keeping their mistakes. Do NOT correct anything. If the audio is silent or unintelligible, return an empty string.'}
 2. score (0-100): how accurately and naturally the answer expresses the meaning of the Japanese prompt. There are many correct answers — do not penalize wording that differs from the reference if it is natural and accurate. Capitalization and punctuation do NOT matter at all: a lowercase first letter, lowercase "i", or a missing period/question mark is fully correct — never lower the score for them and never mention them in feedback or errors${typed ? '' : '. Ignore pronunciation unless a word is unintelligible'}.
    95-100: natural and accurate. 80-94: correct meaning, minor awkwardness. 60-79: understandable but with grammar mistakes or missing nuance. 30-59: major errors or part of the meaning missing. 0-29: wrong or no answer.
+2b. correct (true/false): true if the answer is grammatically correct AND conveys the meaning of the Japanese prompt. It does not need to be the most natural phrasing. Capitalization and punctuation never make it false. Empty answer = false.
 3. corrected: the learner's answer with the minimum changes needed to be correct and natural (same as transcript if already fine; reference translation if the answer is empty).
 4. natural: the most natural thing a native speaker would say in this situation.
 5. feedback_ja: at most 2 very short points in polite Japanese (です・ます, under 40 characters each). What to fix and why, or what was good.
@@ -325,12 +328,13 @@ async function grade(s, wav, typed) {
   if (typed) typed = tidy(typed);
   // exact match with the model answer → instant result, no AI call
   if (typed && norm(typed) === norm(s.en)) {
-    return { transcript: typed, score: 100, corrected: s.en, natural: s.en, feedback_ja: ['模範解答どおりです。完璧です！'], errors: [], correct_lemmas: (s.w || []).slice() };
+    return { transcript: typed, score: 100, correct: true, corrected: s.en, natural: s.en, feedback_ja: ['模範解答どおりです。完璧です！'], errors: [], correct_lemmas: (s.w || []).slice() };
   }
   const parts = [{ text: gradePrompt(s, typed) }];
   if (!typed) parts.push({ inlineData: { mimeType: 'audio/wav', data: b64(wav) } });
   const r = await gemini(parts, GRADE_SCHEMA, { temperature: 0.2 });
   r.score = clamp(Math.round(Number(r.score) || 0), 0, 100);
+  r.correct = r.correct === true || r.correct === 'true';
   // drop "errors" that are only about capitalization or punctuation
   r.errors = (r.errors || []).filter(e => norm(e.wrong) !== norm(e.right));
   r.feedback_ja = (r.feedback_ja || []).filter(f => !/(大文字|小文字|ピリオド|句読点|クエスチョンマーク|capital)/i.test(f));
@@ -340,8 +344,8 @@ async function grade(s, wav, typed) {
 
 const GEN_SCHEMA = { type: 'ARRAY', items: { type: 'OBJECT', properties: {
   ja: { type: 'STRING' }, en: { type: 'STRING' }, sc: { type: 'STRING' }, w: { type: 'ARRAY', items: { type: 'STRING' } } }, required: ['ja', 'en', 'sc', 'w'] } };
-async function generateSentences(level, n = 10) {
-  const scenes = S.settings.scenes.length ? S.settings.scenes : SCENES;
+async function generateSentences(level, n = 10, scene = null) {
+  const scenes = scene ? [scene] : S.settings.scenes.length ? S.settings.scenes : SCENES;
   const unused = WORDS2000.slice(80).filter(w => !S.active[w]);
   const sample = []; for (let i = 0; i < 20 && unused.length; i++) sample.push(unused.splice(Math.floor(Math.random() * Math.min(unused.length, 900)), 1)[0]);
   const examples = allSentences().filter(x => x.lv === level).slice(0, 4).map(x => `- ${x.ja} → ${x.en}`).join('\n');
@@ -359,7 +363,7 @@ Rules:
   const arr = await gemini([{ text: prompt }], GEN_SCHEMA, { temperature: 0.9, timeout: 40000 });
   const ts = Date.now().toString(36);
   const out = (Array.isArray(arr) ? arr : []).filter(x => x && x.ja && x.en).map((x, i) => ({
-    id: `g${ts}${i}`, lv: level, sc: SCENES.includes(x.sc) ? x.sc : scenes[i % scenes.length], ja: x.ja, en: x.en,
+    id: `g${ts}${i}`, lv: level, sc: scene || (SCENES.includes(x.sc) ? x.sc : scenes[i % scenes.length]), ja: x.ja, en: x.en,
     w: [...new Set((x.w || []).map(w => String(w).toLowerCase()))].filter(w => WORDSET.has(w)), gen: true
   }));
   S.generated.push(...out); save();
@@ -387,13 +391,13 @@ function recordResult(s, res, wpm, rt, mode) {
     if (!S.active[w]) { S.active[w] = { t: now, n: 0 }; if (WORDSET.has(w)) fresh.push(w); }
     S.active[w].n++;
   }
-  S.history.push({ t: now, id: s.id, s: res.score, wpm: wpm || null, rt: rt || null, lv: s.lv, m: mode });
+  S.history.push({ t: now, id: s.id, s: res.score, ok: !!res.correct, wpm: wpm || null, rt: rt || null, lv: s.lv, sc: s.sc, m: mode });
   if (S.history.length > 3000) S.history.splice(0, S.history.length - 3000);
   return fresh;
 }
 
 // ---------- views ----------
-let tab = 'practice';
+let tab = 'home';
 let P = null; // current practice context
 function setTab(t) {
   if (Rec.on) return toast('録音中です');
@@ -402,11 +406,14 @@ function setTab(t) {
   if (t !== 'practice') Rec.release();
   render();
 }
+function highlightTab(t) { tab = t; document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === t)); }
+function goHome() { setTab('home'); }
+function goPractice() { highlightTab('practice'); window.scrollTo(0, 0); }
 document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => setTab(b.dataset.tab));
 function render() {
   window.scrollTo(0, 0);
   if (!S.settings.apiKey) return renderSetup();
-  ({ practice: renderPractice, stats: renderStats, vocab: renderVocab, settings: renderSettings })[tab]();
+  ({ home: renderHome, practice: renderPractice, stats: renderStats, vocab: renderVocab, settings: renderSettings })[tab]();
 }
 
 // --- first-run setup
@@ -437,17 +444,87 @@ function renderSetup() {
       save();
       document.querySelectorAll('#tabs button').forEach(b => b.disabled = false);
       toast('設定しました');
-      tab = 'practice'; render();
+      tab = 'home'; highlightTab('home'); render();
     } catch (e) { $('#msg').textContent = 'キーを確認できませんでした：' + e.message; }
   };
 }
 
 // --- practice
+const SESSION_N = 15;
+let pview = 'dash';            // 'dash' | 'q' | 'review' | 'summary'
+let dashSel = { lv: null, sc: null };
+let reviewIdx = 0, reviewFrom = 'q';
+
+function sentenceOf(e) { return findSentence(e.id) || { id: e.id, ja: '（削除された例文）', en: e.res?.natural || '', lv: 0, sc: '' }; }
+function isOk(h) { return h.ok != null ? h.ok : h.s >= 80; }
+function sceneOfHist(h) { return h.sc || findSentence(h.id)?.sc; }
+// correct answers among the latest 15 answers in a category
+function catStats(fn) {
+  const hs = S.history.filter(h => h.m !== 'retry' && fn(h)).slice(-SESSION_N);
+  return { n: hs.length, ok: hs.filter(isOk).length };
+}
+function statLabel(st) {
+  if (!st.n) return '<span class="sub">—</span>';
+  return `${st.ok}/${SESSION_N}` + (st.n < SESSION_N ? `<span class="sub" style="font-size:10px">・${st.n}問</span>` : '');
+}
+function condLabel(ss) {
+  if (!ss || ss.mode === 'auto') return 'おまかせ';
+  return [ss.lv ? `Lv${ss.lv}` : null, ss.sc].filter(Boolean).join(' × ');
+}
+
+function renderHome() {
+  if (S.rating == null) return renderPlacementIntro();
+  renderDashboard();
+}
 function renderPractice() {
   if (S.rating == null && !S.placement) return renderPlacementIntro();
-  if (!P || P.done) return nextQuestion();
-  drawQuestion();
+  if (S.placement) { if (!P || !P.placement) return nextQuestion(); return drawQuestion(); }
+  const ss = S.session;
+  if (pview === 'review' && ss) return drawReview();
+  if (ss && ss.done && pview === 'summary') return drawSummary();
+  if (ss && !ss.done) { pview = 'q'; if (P && !P.placement && P.state !== 'busy') return drawQuestion(); return nextQuestion(); }
+  // nothing in progress
+  $('#view').innerHTML = `
+  <h1>練習</h1>
+  <div class="card center">
+    <p>ホームでレベルやテーマを選んで始めましょう。</p>
+    <p class="sub">1セット${SESSION_N}問です。</p><p></p>
+    <button class="primary full" id="auto2">おまかせで始める</button><p></p>
+    <button class="full" id="tohome">ホームで選ぶ</button>
+  </div>`;
+  $('#auto2').onclick = () => startSession({ mode: 'auto', lv: null, sc: null });
+  $('#tohome').onclick = goHome;
 }
+
+function renderDashboard() {
+  pview = 'dash';
+  const ss = S.session, inProg = ss && !ss.done && ss.entries.length > 0;
+  const lvTiles = [1,2,3,4,5,6,7,8,9,10].map(l => `<button class="tile ${dashSel.lv === l ? 'on' : ''}" data-lv="${l}"><b>Lv${l}</b><span>${statLabel(catStats(h => h.lv === l))}</span></button>`).join('');
+  const scTiles = SCENES.map(c => `<button class="tile ${dashSel.sc === c ? 'on' : ''}" data-sc="${c}"><b>${c}</b><span>${statLabel(catStats(h => sceneOfHist(h) === c))}</span></button>`).join('');
+  const pickLabel = [dashSel.lv ? `Lv${dashSel.lv}` : null, dashSel.sc].filter(Boolean).join(' × ');
+  $('#view').innerHTML = `
+  <div class="row"><h1 style="margin:4px 0 10px">ホーム</h1><span class="spacer"></span><span class="sub">今の実力 ${levelLabel(S.rating)}</span></div>
+  ${inProg ? `<div class="card" style="border-color:var(--accent)"><div class="row"><div><b>続きから</b><div class="sub">${esc(condLabel(ss))}・${ss.entries.length}/${SESSION_N}問</div></div><span class="spacer"></span><button class="primary" id="resume">再開</button></div></div>` : ''}
+  <button class="primary full" id="auto" style="padding:14px">おまかせで始める<div style="font-weight:400;font-size:13px;opacity:.9">実力に合わせて自動で出題・${SESSION_N}問</div></button>
+  <div class="lbl">レベルを選ぶ</div>
+  <div class="tiles g5">${lvTiles}</div>
+  <div class="lbl">テーマを選ぶ</div>
+  <div class="tiles g2">${scTiles}</div>
+  <p class="sub" style="margin-top:8px">数字は各レベル・テーマの直近${SESSION_N}問の正解数（文法と意味が正しければ正解）</p>
+  <button class="full" id="pick" ${pickLabel ? '' : 'disabled'}>${pickLabel ? esc(pickLabel) + ' で始める' : 'レベルかテーマを選んでください'}</button>`;
+  document.querySelectorAll('[data-lv]').forEach(b => b.onclick = () => { const l = Number(b.dataset.lv); dashSel.lv = dashSel.lv === l ? null : l; renderDashboard(); });
+  document.querySelectorAll('[data-sc]').forEach(b => b.onclick = () => { const c = b.dataset.sc; dashSel.sc = dashSel.sc === c ? null : c; renderDashboard(); });
+  $('#auto').onclick = () => startSession({ mode: 'auto', lv: null, sc: null });
+  $('#pick').onclick = () => { if (pickLabel) startSession({ mode: 'pick', lv: dashSel.lv, sc: dashSel.sc }); };
+  if (inProg) $('#resume').onclick = () => { pview = 'q'; setTab('practice'); };
+}
+function startSession(cond) {
+  const ss = S.session;
+  if (ss && !ss.done && ss.entries.length > 0 && !confirm(`途中のセット（${condLabel(ss)}・${ss.entries.length}/${SESSION_N}問）を終えて、新しく始めますか？`)) return;
+  S.session = { mode: cond.mode, lv: cond.lv, sc: cond.sc, entries: [], done: false, t: Date.now() };
+  save(); P = null; pview = 'q'; goPractice(); nextQuestion();
+}
+
 function renderPlacementIntro() {
   P = null;
   $('#view').innerHTML = `
@@ -464,44 +541,95 @@ function renderPlacementIntro() {
     <p></p>
     <button class="full" id="skip">このレベルで始める</button>
   </div>`;
-  $('#start').onclick = () => { S.placement = { i: 0, r: 4.0, used: [] }; save(); P = null; nextQuestion(); };
-  $('#skip').onclick = () => { S.rating = Number($('#lv').value); S.ratingHist.push([Date.now(), S.rating]); save(); P = null; nextQuestion(); };
+  $('#start').onclick = () => { S.placement = { i: 0, r: 4.0, used: [] }; save(); P = null; goPractice(); nextQuestion(); };
+  $('#skip').onclick = () => { S.rating = Number($('#lv').value); S.ratingHist.push([Date.now(), S.rating]); save(); P = null; goHome(); };
 }
 
-async function nextQuestion(excludeId) {
+// choose a sentence for a "pick" session (fixed level and/or theme)
+function pickForCond(ss, exclude) {
+  const target = (S.rating ?? 4.5) + 0.4;
+  let pool = allSentences().filter(x => !exclude.has(x.id) && (!ss.lv || x.lv === ss.lv) && (!ss.sc || x.sc === ss.sc));
+  if (!ss.lv) { const near = pool.filter(x => Math.abs(x.lv - target) <= 1.6); if (near.length) pool = near; }
+  if (!pool.length) return null;
+  const now = Date.now();
+  const due = pool.filter(x => { const it = S.items[x.id]; return it && it.rev && it.due <= now; });
+  if (due.length && ss.entries.length % 2 === 1) return { s: due[0], review: true };
+  const unseen = pool.filter(x => !S.items[x.id]);
+  if (unseen.length) {
+    let best = null, bv = -1e9;
+    for (const x of unseen) { const v = (ss.lv ? 0 : -Math.abs(x.lv - target) * 2) + 0.35 * Math.min(newWordCount(x), 5) + Math.random() * 0.9; if (v > bv) { bv = v; best = x; } }
+    return { s: best, review: false };
+  }
+  return { s: null, seen: pool.sort((a, b) => (S.items[a.id]?.t || 0) - (S.items[b.id]?.t || 0)) };
+}
+
+async function nextQuestion() {
   if (S.placement) {
     const s = pickPlacement();
     P = { s, review: false, placement: true, shown: Date.now(), state: 'ask' };
     return drawQuestion();
   }
-  let pick = pickNext(excludeId);
+  const ss = S.session;
+  if (!ss || ss.done) return goHome();
+  if (ss.entries.length >= SESSION_N) return finishSession();
+  pview = 'q';
+  const exclude = new Set(ss.entries.map(e => e.id));
+  let pick;
+  const genLevel = ss.lv || clamp(Math.round((S.rating ?? 4.5) + 0.4), 1, 10);
+  if (ss.mode === 'auto') pick = pickNext(exclude);
+  else { const r = pickForCond(ss, exclude); pick = r && r.s ? r : null; if (!pick) pickForCond._seen = r ? r.seen : []; }
   if (!pick) {
-    $('#view').innerHTML = `<div class="card center"><p><span class="spin"></span></p><p>あなたのレベルに合った新しい例文をAIが作っています…</p></div>`;
+    $('#view').innerHTML = `<div class="card center"><p><span class="spin"></span></p><p>この条件の新しい例文をAIが作っています…</p></div>`;
     try {
-      const lv = clamp(Math.round((S.rating ?? 4.5) + 0.4), 1, 10);
-      await generateSentences(lv, 10);
-      pick = pickNext(excludeId);
+      await generateSentences(genLevel, 10, ss.sc);
+      if (ss.mode === 'auto') pick = pickNext(exclude);
+      else { const r = pickForCond(ss, exclude); pick = r && r.s ? r : null; }
     } catch (e) { toast('例文の生成に失敗：' + e.message, 4000); }
-    if (!pick) pick = { s: pickFallback(excludeId), review: false };
+    if (!pick) {
+      const seen = (ss.mode === 'auto' ? [] : (pickForCond._seen || []));
+      const s = seen[0] || pickFallback(null, exclude);
+      pick = { s, review: false };
+    }
   }
-  P = { s: pick.s, review: pick.review, placement: false, shown: Date.now(), state: 'ask' };
+  const entry = { id: pick.s.id, qa: [] };
+  P = { s: pick.s, review: pick.review, placement: false, shown: Date.now(), state: 'ask', entry, qa: entry.qa };
   drawQuestion();
 }
 
 function drawQuestion() {
-  const { s } = P, mode = S.settings.inputMode;
-  const head = P.placement
-    ? `<span class="chip">レベル測定 ${S.placement.i + 1}/${PLACEMENT_N}</span>`
-    : `<span class="chip">Lv ${s.lv}</span> <span class="chip gray">${esc(s.sc)}</span> ${P.review ? '<span class="chip rev">復習</span>' : ''}`;
+  const { s } = P, mode = S.settings.inputMode, ss = S.session;
+  let head;
+  if (P.placement) head = `<span class="chip">レベル測定 ${S.placement.i + 1}/${PLACEMENT_N}</span><span class="spacer"></span>`;
+  else {
+    const answered = ss.entries.length, num = P.state === 'done' && !P.retry ? answered : answered + (P.retry ? 0 : 1);
+    const canBack = backIndex() >= 0;
+    head = `${canBack ? '<button class="ghost" id="back" style="padding:6px 4px;color:var(--accent)">‹ 前の問題</button>' : ''}
+      <span class="spacer"></span><span class="chip">${Math.min(num, SESSION_N)}/${SESSION_N}</span>
+      <span class="chip gray">${esc(condLabel(ss))}</span>${P.review ? '<span class="chip rev">復習</span>' : ''}
+      <button class="ghost" id="chg" style="padding:6px 4px">変更</button>`;
+  }
   $('#view').innerHTML = `
-  <div class="row">${head}<span class="spacer"></span><span class="sub">${P.placement ? '' : levelLabel(S.rating)}</span></div>
+  <div class="row" style="gap:6px">${head}</div>
+  ${P.placement ? '' : `<div class="sub" style="margin-top:4px">Lv ${s.lv}・${esc(s.sc)}</div>`}
   <div class="card">
     <div class="ja">${esc(s.ja)}</div>
     <div id="ans"></div>
   </div>
   <div id="res"></div>`;
+  if (!P.placement) {
+    if ($('#back')) $('#back').onclick = () => { if (Rec.on) return; speechSynthesis?.cancel(); openReview(backIndex(), 'q'); };
+    $('#chg').onclick = () => { if (Rec.on) return; goHome(); };
+  }
   drawAnswerArea(mode);
+  if (P.state === 'done') drawResult(false);
 }
+// index of the entry "前の問題" should open from the question screen
+function backIndex() {
+  const ss = S.session; if (!ss || !P || P.placement) return -1;
+  const curIdx = ss.entries.indexOf(P.entry);
+  return curIdx >= 0 ? curIdx - 1 : ss.entries.length - 1;
+}
+
 function drawAnswerArea(mode) {
   const box = $('#ans');
   if (P.state === 'busy') {
@@ -567,107 +695,178 @@ function passQuestion() {
   submit(null, null, true);
 }
 async function submit(audio, typed, passed) {
-  const s = P.s;
+  const s = P.s, myP = P;
   P.state = 'busy'; drawAnswerArea();
   let res;
   if (passed) {
-    res = { transcript: '', score: 0, corrected: s.en, natural: s.en, feedback_ja: ['パスしました。模範解答を声に出して何度か言ってみましょう。'], errors: [], correct_lemmas: [] };
+    res = { transcript: '', score: 0, correct: false, corrected: s.en, natural: s.en, feedback_ja: ['パスしました。模範解答を声に出して何度か言ってみましょう。'], errors: [], correct_lemmas: [] };
   } else {
     try { res = await grade(s, audio && audio.wav, typed); }
     catch (e) {
       // keep the answer so it can be resent (e.g. no signal in a tunnel)
-      P.state = 'ask'; P.pending = { audio, typed };
+      myP.state = 'ask'; myP.pending = { audio, typed };
+      if (P !== myP || !$('#ans')) return;
       drawAnswerArea(typed ? 'text' : S.settings.inputMode);
       if (typed && $('#txt')) $('#txt').value = typed;
       showResend(e.message);
       return;
     }
-    P.pending = null;
+    myP.pending = null;
   }
   // speed: words per minute of actual speech; reaction = time until you started answering
   let wpm = null, rt = null;
   if (audio && res.transcript) {
     const n = countWords(res.transcript);
     if (n >= 2 && audio.voiced >= 0.6) wpm = Math.min(300, Math.round(n / (audio.voiced / 60)));
-    rt = P.recStart ? (P.recStart - P.shown) / 1000 : null;
-  } else if (typed && P.typeStart) rt = (P.typeStart - P.shown) / 1000;
+    rt = myP.recStart ? (myP.recStart - myP.shown) / 1000 : null;
+  } else if (typed && myP.typeStart) rt = (myP.typeStart - myP.shown) / 1000;
 
   let delta = 0, fresh = [];
-  const first = !P.retry;
-  if (first) {
+  if (!myP.retry) {
     fresh = recordResult(s, res, wpm, rt, passed ? 'pass' : typed ? 'text' : 'voice');
-    if (P.placement) {
+    if (myP.placement) {
       const pl = S.placement; pl.used.push(s.id);
       const K = 1.5 * Math.pow(0.86, pl.i);
       const R0 = pl.r;
       pl.r = clamp(R0 + K * (perfValue(res.score, wpm) - pSuccess(R0, s.lv)), 1, 10);
       pl.i++;
     } else {
-      delta = updateRating(s.lv, res.score, wpm, P.review ? 0.2 : 0.35);
+      delta = updateRating(s.lv, res.score, wpm, myP.review ? 0.2 : 0.35);
       S.qCount++;
+      Object.assign(myP.entry, { res, wpm, rt, delta, fresh, ok: !!res.correct, t: Date.now() });
+      S.session.entries.push(myP.entry);
     }
   } else {
-    // retry of the same sentence: count words, don't move the level
+    // retry of the same sentence: count words, don't move the level or the score of the set
     for (const raw of res.correct_lemmas || []) { const w = String(raw).toLowerCase(); if (!S.active[w]) { S.active[w] = { t: Date.now(), n: 1 }; if (WORDSET.has(w)) fresh.push(w); } }
     if (res.score >= 80 && S.items[s.id]) { S.items[s.id].due = Date.now() + DAY; }
   }
   save();
-  P.state = 'done'; P.res = res; P.wpm = wpm; P.rt = rt; P.delta = delta; P.fresh = fresh;
-  drawAnswerArea();
-  drawResult();
+  Object.assign(myP, { state: 'done', res, wpm, rt, delta, fresh });
+  if (P !== myP || tab !== 'practice' || (pview !== 'q' && !myP.placement)) return; // user moved to another screen meanwhile
+  drawQuestion();
   if (S.settings.autoSpeak && res.score < 95) setTimeout(() => speak(res.natural || s.en), 300);
 }
 
-function drawResult() {
-  const { s, res, wpm, rt, delta, fresh } = P;
-  const placementFinished = P.placement && S.placement.i >= PLACEMENT_N;
+// result card shared by the live result and the review screen
+function resultCardHTML(s, r, meta) {
+  const res = r.res, items = [];
   const sameAsCorrected = norm(res.corrected || '') === norm(res.transcript || '');
-  const items = [];
-  items.push(`<div class="row"><div class="score ${scoreClass(res.score)}">${res.score}</div><div class="sub">/100</div><span class="spacer"></span>
-    <div style="text-align:right" class="sub">${wpm ? `話す速さ <b>${wpm}</b> 語/分<br>` : ''}${rt != null ? `反応 ${rt.toFixed(1)}秒` : ''}${!P.placement && delta ? `<br>レベル ${delta > 0 ? '+' : ''}${delta.toFixed(2)}` : ''}</div></div>`);
+  items.push(`<div class="row"><div class="score ${scoreClass(res.score)}">${res.score}</div><div class="sub">/100</div>
+    ${res.correct != null ? `<span class="chip ${res.correct ? '' : 'gray'}" style="margin-left:8px">${res.correct ? '✓ 正解' : '✗ 不正解'}</span>` : ''}<span class="spacer"></span>
+    <div style="text-align:right" class="sub">${r.wpm ? `話す速さ <b>${r.wpm}</b> 語/分<br>` : ''}${r.rt != null ? `反応 ${r.rt.toFixed(1)}秒` : ''}${meta.showDelta && r.delta ? `<br>レベル ${r.delta > 0 ? '+' : ''}${r.delta.toFixed(2)}` : ''}</div></div>`);
   items.push(`<div class="lbl">あなたの回答</div><div class="en">${res.transcript ? esc(res.transcript) : '<span class="sub">（なし）</span>'}</div>`);
   if (res.transcript && !sameAsCorrected) items.push(`<div class="lbl">直すなら</div><div class="say"><div class="en good">${esc(res.corrected)}</div><button class="spk" data-say="${esc(res.corrected)}">▶</button></div>`);
   if (res.feedback_ja?.length) items.push(`<ul class="fb">${res.feedback_ja.map(f => `<li>${esc(f)}</li>`).join('')}</ul>`);
   if (res.errors?.length) items.push(res.errors.map(e => `<div class="err"><s>${esc(e.wrong)}</s> → <b>${esc(e.right)}</b><br><span class="sub">${esc(e.why_ja)}</span></div>`).join(''));
   items.push(`<div class="lbl">ネイティブならこう言う</div><div class="say"><div class="en">${esc(res.natural)}</div><button class="spk" data-say="${esc(res.natural)}">▶</button></div>`);
   if ((res.natural || '').trim() !== s.en.trim()) items.push(`<div class="lbl">模範解答</div><div class="say"><div class="en">${esc(s.en)}</div><button class="spk" data-say="${esc(s.en)}">▶</button></div>`);
-  if (fresh?.length) items.push(`<div class="lbl">新しく使えた単語 +${fresh.length}</div><div class="words">${fresh.map(w => `<span class="new">${esc(w)}</span>`).join('')}</div>`);
-  const btns = placementFinished
-    ? `<button class="primary full" id="fin">結果を見る</button>`
-    : `<div class="row"><button class="primary" style="flex:2" id="next">次へ</button><button style="flex:1" id="retry">もう一度</button></div>`;
-  const ask = `<div class="card" id="askbox">
+  if (r.fresh?.length) items.push(`<div class="lbl">新しく使えた単語 +${r.fresh.length}</div><div class="words">${r.fresh.map(w => `<span class="new">${esc(w)}</span>`).join('')}</div>`);
+  return `<div class="card">${items.join('')}</div>`;
+}
+const ASK_HTML = `<div class="card" id="askbox">
     <div class="lbl" style="margin-top:0">AIに質問</div>
     <div id="qa"></div>
     <textarea id="q" placeholder="自由に質問できます" style="min-height:64px;margin-top:8px"></textarea>
     <p></p><button class="full" id="askbtn">質問する</button>
   </div>`;
-  $('#res').innerHTML = `<div class="card">${items.join('')}</div>${btns}${ask}`;
-  P.qa = P.qa || [];
-  drawQA();
-  $('#askbtn').onclick = askAI;
+function wireCard(ctx) {
   document.querySelectorAll('[data-say]').forEach(b => b.onclick = () => speak(b.dataset.say));
+  drawQA(ctx);
+  $('#askbtn').onclick = () => askAI(ctx);
+}
+
+function drawResult(scroll = true) {
+  const { s } = P;
+  const placementFinished = P.placement && S.placement.i >= PLACEMENT_N;
+  const ss = S.session, last = !P.placement && ss && ss.entries.length >= SESSION_N;
+  let btns;
+  if (placementFinished) btns = `<button class="primary full" id="fin">結果を見る</button>`;
+  else if (last) btns = `<div class="row"><button class="primary" style="flex:2" id="next">${SESSION_N}問の結果を見る</button><button style="flex:1" id="retry">もう一度</button></div>`;
+  else btns = `<div class="row"><button class="primary" style="flex:2" id="next">次へ</button><button style="flex:1" id="retry">もう一度</button></div>`;
+  $('#res').innerHTML = resultCardHTML(s, P, { showDelta: !P.placement }) + btns + ASK_HTML;
+  P.qa = P.qa || [];
+  wireCard(P);
   if (placementFinished) $('#fin').onclick = finishPlacement;
   else {
-    $('#next').onclick = () => { speechSynthesis?.cancel(); nextQuestion(s.id); };
-    $('#retry').onclick = () => { speechSynthesis?.cancel(); P = { s, review: P.review, placement: false, retry: true, shown: Date.now(), state: 'ask' }; drawQuestion(); };
+    $('#next').onclick = () => { speechSynthesis?.cancel(); if (last) finishSession(); else nextQuestion(); };
+    $('#retry').onclick = () => { speechSynthesis?.cancel(); P = { s, review: P.review, placement: P.placement, retry: true, entry: P.entry, shown: Date.now(), state: 'ask', qa: [] }; drawQuestion(); };
   }
-  $('#res').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  if (scroll) $('#res').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
+
+// --- review of earlier answers in the set
+function openReview(i, from) { if (i < 0) return; reviewIdx = i; reviewFrom = from; pview = 'review'; drawReview(); }
+function drawReview() {
+  const ss = S.session, e = ss.entries[reviewIdx];
+  if (!e) return renderPractice();
+  const s = sentenceOf(e);
+  // when coming from the question screen, don't page forward onto the question in progress
+  const curIdx = P ? ss.entries.indexOf(P.entry) : -1;
+  const maxIdx = reviewFrom === 'q' ? (curIdx >= 0 ? curIdx - 1 : ss.entries.length - 1) : ss.entries.length - 1;
+  window.scrollTo(0, 0);
+  $('#view').innerHTML = `
+  <div class="row" style="gap:6px">
+    ${reviewIdx > 0 ? '<button class="ghost" id="rprev" style="padding:6px 4px;color:var(--accent)">‹ 前の問題</button>' : ''}
+    <span class="spacer"></span><span class="chip gray">${reviewIdx + 1}/${SESSION_N} の解説</span>
+    ${reviewIdx < maxIdx ? '<button class="ghost" id="rnext" style="padding:6px 4px;color:var(--accent)">次 ›</button>' : ''}
+  </div>
+  <div class="card"><div class="sub">Lv ${s.lv}・${esc(s.sc)}</div><div class="ja" style="margin-top:6px">${esc(s.ja)}</div></div>
+  ${resultCardHTML(s, e, { showDelta: true })}
+  <button class="primary full" id="rback">${reviewFrom === 'q' ? '問題に戻る ›' : '結果一覧に戻る'}</button>
+  ${ASK_HTML}`;
+  const ctx = { s, res: e.res, qa: (e.qa = e.qa || []) };
+  wireCard(ctx);
+  if ($('#rprev')) $('#rprev').onclick = () => { reviewIdx--; drawReview(); };
+  if ($('#rnext')) $('#rnext').onclick = () => { reviewIdx++; drawReview(); };
+  $('#rback').onclick = () => { speechSynthesis?.cancel(); if (reviewFrom === 'q') { pview = 'q'; if (P) { drawQuestion(); window.scrollTo(0, 0); } else nextQuestion(); } else drawSummary(); };
+}
+
+// --- end of a 15-question set
+function finishSession() {
+  const ss = S.session; ss.done = true; ss.end = Date.now(); save();
+  P = null; drawSummary();
+}
+function drawSummary() {
+  pview = 'summary';
+  const ss = S.session, es = ss.entries;
+  const ok = es.filter(e => e.ok).length;
+  const avg = es.length ? Math.round(es.reduce((a, e) => a + (e.res?.score || 0), 0) / es.length) : 0;
+  const w = es.filter(e => e.wpm); const avgW = w.length ? Math.round(w.reduce((a, e) => a + e.wpm, 0) / w.length) : null;
+  window.scrollTo(0, 0);
+  $('#view').innerHTML = `
+  <h1>${SESSION_N}問 おつかれさまでした</h1>
+  <div class="card center">
+    <div class="sub">${esc(condLabel(ss))}</div>
+    <div class="score ${ok >= 12 ? 'good' : ok >= 8 ? 'mid' : 'bad'}" style="margin:8px 0">${ok}/${SESSION_N}</div>
+    <div class="sub">平均スコア ${avg}${avgW ? `・話す速さ ${avgW}語/分` : ''}・今の実力 ${levelLabel(S.rating)}</div>
+  </div>
+  <div class="card" style="padding:6px 12px">
+    ${es.map((e, i) => { const s = sentenceOf(e); return `<div class="row sumrow" data-i="${i}" style="padding:10px 0;border-bottom:1px solid var(--line);cursor:pointer">
+      <span class="${e.ok ? 'good' : 'bad'}" style="font-weight:800;width:18px">${e.ok ? '✓' : '✗'}</span>
+      <span style="flex:1;font-size:15px">${esc(s.ja)}</span><span class="sub">${e.res?.score ?? ''}</span><span class="sub">›</span></div>`; }).join('')}
+  </div>
+  <div class="row"><button class="primary" style="flex:1" id="again">同じ条件でもう${SESSION_N}問</button><button style="flex:1" id="home">ホームへ</button></div>`;
+  document.querySelectorAll('.sumrow').forEach(r => r.onclick = () => openReview(Number(r.dataset.i), 'summary'));
+  $('#again').onclick = () => startSession({ mode: ss.mode, lv: ss.lv, sc: ss.sc });
+  $('#home').onclick = goHome;
+}
+
 // ---------- free questions about the sentence ----------
 function fmt(t) {
   return esc(t).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/^[*-] /gm, '・').replace(/\n/g, '<br>');
 }
-function drawQA() {
+function drawQA(ctx) {
   const box = $('#qa'); if (!box) return;
-  box.innerHTML = P.qa.map(x => `<div style="margin:10px 0"><div class="sub"><b>Q.</b> ${esc(x.q)}</div>
+  box.innerHTML = (ctx.qa || []).map(x => `<div style="margin:10px 0"><div class="sub"><b>Q.</b> ${esc(x.q)}</div>
     <div style="margin-top:4px">${x.a == null ? '<span class="spin"></span>' : fmt(x.a)}</div></div>`).join('');
 }
-async function askAI() {
+async function askAI(ctx) {
   const q = $('#q').value.trim(); if (!q) return;
-  const { s, res } = P;
-  const item = { q, a: null }; P.qa.push(item); $('#q').value = ''; drawQA();
+  const { s, res } = ctx;
+  const item = { q, a: null }; ctx.qa.push(item); $('#q').value = ''; drawQA(ctx);
   const btn = $('#askbtn'); btn.disabled = true;
-  const history = P.qa.slice(0, -1).map(x => `Q: ${x.q}\nA: ${x.a}`).join('\n\n');
+  const history = ctx.qa.slice(0, -1).map(x => `Q: ${x.q}\nA: ${x.a}`).join('\n\n');
   const prompt = `あなたは日本人の英語学習者を手伝う、親切で的確な英語の先生です。
 学習者は瞬間英作文の練習中で、次の問題に答えたところです。
 - 日本語のお題：${s.ja}
@@ -681,7 +880,8 @@ ${history ? `\nこれまでのやりとり：\n${history}\n` : ''}
 日本語で、短く分かりやすく答えてください（目安200字以内）。単語のニュアンスや使い分けを聞かれたら、短い英語の例文を1〜2個つけてください。大文字・小文字やピリオドの有無は問題にしないでください。`;
   try { item.a = await gemini([{ text: prompt }], null, { text: true, timeout: 20000 }); }
   catch (e) { item.a = '⚠ ' + e.message; }
-  btn.disabled = false; drawQA();
+  save();
+  if ($('#askbtn')) { $('#askbtn').disabled = false; drawQA(ctx); }
 }
 function finishPlacement() {
   const r = Math.round(S.placement.r * 10) / 10;
@@ -693,10 +893,10 @@ function finishPlacement() {
     <div class="score" style="margin:8px 0">Lv ${r.toFixed(1)}</div>
     <p class="sub">${LEVEL_DESC[clamp(Math.round(r), 1, 10)]}</p>
   </div>
-  <div class="card"><p>ここからは、今のレベルより<b>少しだけ難しい</b>文が出ます。答えるたびにレベルが自動で上下します。間違えた文は日をおいて復習に出てきます。</p></div>
-  <button class="primary full" id="go">練習を始める</button>`;
+  <div class="card"><p>練習は1セット${SESSION_N}問です。「おまかせ」では今のレベルより<b>少しだけ難しい</b>文が出ます。レベルやテーマを自分で選ぶこともできます。答えるたびに実力のレベルが自動で上下し、間違えた文は日をおいて復習に出てきます。</p></div>
+  <button class="primary full" id="go">ホームで練習を選ぶ</button>`;
   P = null;
-  $('#go').onclick = () => nextQuestion();
+  $('#go').onclick = goHome;
 }
 
 // --- stats
@@ -773,8 +973,6 @@ function renderSettings() {
     <button class="full" id="test">接続テスト</button><p id="tmsg" class="sub"></p>
   </div>
   <div class="card">
-    <label>出題する場面（未選択ならすべて）</label>
-    <div class="check">${SCENES.map(sc => `<label><input type="checkbox" value="${sc}" ${st.scenes.includes(sc) ? 'checked' : ''}>${sc}</label>`).join('')}</div>
     <label>復習から外すまでの連続正解数</label>
     <select id="streak">${[1,2,3,4,5].map(i => `<option ${i === st.reviewStreak ? 'selected' : ''}>${i}</option>`).join('')}</select>
     <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="auto" style="width:auto" ${st.autoSpeak ? 'checked' : ''}>採点後にお手本を自動で読み上げる</label>
@@ -806,9 +1004,6 @@ function renderSettings() {
       $('#tmsg').textContent = r.ok ? `OK（${st.model}・${((performance.now() - t0) / 1000).toFixed(1)}秒）` : '応答が想定外でした';
     } catch (e) { $('#tmsg').textContent = e.message; }
   };
-  document.querySelectorAll('.check input').forEach(c => c.onchange = () => {
-    st.scenes = [...document.querySelectorAll('.check input:checked')].map(x => x.value); save();
-  });
   $('#streak').onchange = e => { st.reviewStreak = Number(e.target.value); save(); };
   $('#auto').onchange = e => { st.autoSpeak = e.target.checked; save(); };
   $('#exp').onclick = () => {

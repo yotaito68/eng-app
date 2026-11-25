@@ -239,11 +239,11 @@ async function gemini(parts, schema, opt = {}) {
   if (!key) throw new ApiError('APIキーが未設定です。設定タブで入力してください。', 0);
   const timeout = opt.timeout || (fast ? 10000 : 25000);
   let lastErr;
-  for (const model of modelOrder().slice(0, 3)) {
+  for (const model of modelOrder().slice(0, opt.tries || 2)) {
     const g3 = !/gemini-[12]\./.test(model);
     // minimal thinking = fastest answer; retry without the setting if a model rejects it
     for (const withThinking of [true, false]) {
-      const gc = { responseMimeType: 'application/json', responseSchema: schema };
+      const gc = opt.text ? {} : { responseMimeType: 'application/json', responseSchema: schema };
       if (!g3 && opt.temperature != null) gc.temperature = opt.temperature;
       if (withThinking) gc.thinkingConfig = g3 ? { thinkingLevel: fast ? 'minimal' : 'low' } : { thinkingBudget: 0 };
       const ctl = new AbortController(); curCtl = ctl;
@@ -258,7 +258,8 @@ async function gemini(parts, schema, opt = {}) {
         clearTimeout(timer);
         if (ctl.userCancel) throw new ApiError('中止しました', -1);
         if (e.name === 'AbortError') { lastErr = new ApiError('AIの応答に時間がかかりすぎました。', 408); break; } // try next model
-        throw new ApiError('通信できませんでした。電波の状態を確認してください。', 0);
+        if (navigator.onLine === false) throw new ApiError('オフラインです。電波が戻ったら再送信してください。', 0);
+        lastErr = new ApiError('AIとの通信が途中で切れました。', 0); break; // try next model
       }
       let d;
       try { d = r.ok ? await r.json() : null; } catch (e) {
@@ -271,7 +272,7 @@ async function gemini(parts, schema, opt = {}) {
         const text = (d.candidates?.[0]?.content?.parts || []).filter(p => p.text && !p.thought).map(p => p.text).join('');
         if (!text) { lastErr = new ApiError('AIから空の応答が返りました。もう一度試してください。', 200); break; }
         if (!S.settings.modelPinned && S.settings.model !== model) { S.settings.model = model; save(); }
-        return JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, ''));
+        return opt.text ? text : JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, ''));
       }
       const msg = await errText(r);
       lastErr = new ApiError(msg, r.status);
@@ -281,6 +282,7 @@ async function gemini(parts, schema, opt = {}) {
       break; // 404/429/5xx → try next model
     }
   }
+  if (lastErr && (lastErr.status === 408 || lastErr.status === 0)) throw new ApiError(lastErr.message + 'もう一度「再送信」を押してください。続く場合は設定の「接続テスト」を試してください。', lastErr.status);
   if (lastErr?.status === 429) throw new ApiError('今日の無料枠の上限に達したようです。少し時間をおくか、明日（日本時間の夕方以降）に再開してください。', 429);
   throw lastErr || new ApiError('AIの呼び出しに失敗しました', 0);
 }
@@ -306,7 +308,7 @@ The learner's answer is ${typed ? `this typed text: """${typed}"""` : 'in the at
 
 Be brief — speed matters. Reply in JSON:
 1. transcript: ${typed ? 'copy the learner\'s text as is.' : 'transcribe exactly what the learner said in English, verbatim, keeping their mistakes. Do NOT correct anything. If the audio is silent or unintelligible, return an empty string.'}
-2. score (0-100): how accurately and naturally the answer expresses the meaning of the Japanese prompt. There are many correct answers — do not penalize wording that differs from the reference if it is natural and accurate. Ignore capitalization and punctuation${typed ? '' : ', and ignore pronunciation unless a word is unintelligible'}.
+2. score (0-100): how accurately and naturally the answer expresses the meaning of the Japanese prompt. There are many correct answers — do not penalize wording that differs from the reference if it is natural and accurate. Capitalization and punctuation do NOT matter at all: a lowercase first letter, lowercase "i", or a missing period/question mark is fully correct — never lower the score for them and never mention them in feedback or errors${typed ? '' : '. Ignore pronunciation unless a word is unintelligible'}.
    95-100: natural and accurate. 80-94: correct meaning, minor awkwardness. 60-79: understandable but with grammar mistakes or missing nuance. 30-59: major errors or part of the meaning missing. 0-29: wrong or no answer.
 3. corrected: the learner's answer with the minimum changes needed to be correct and natural (same as transcript if already fine; reference translation if the answer is empty).
 4. natural: the most natural thing a native speaker would say in this situation.
@@ -315,7 +317,12 @@ Be brief — speed matters. Reply in JSON:
 7. correct_lemmas: lowercase dictionary forms (e.g. went→go, children→child) of the English words the learner used correctly in their answer. Exclude words used incorrectly.`;
 }
 const norm = t => String(t).toLowerCase().replace(/[’']/g, "'").replace(/[^a-z0-9' ]+/g, ' ').replace(/\s+/g, ' ').trim();
+// Tidy typed text before grading: capital first letter and "I", so case never costs points
+function tidy(t) {
+  return String(t).trim().replace(/\bi\b(?=[\s',.!?]|$)/g, 'I').replace(/^([^A-Za-z]*)([a-z])/, (m, p, c) => p + c.toUpperCase());
+}
 async function grade(s, wav, typed) {
+  if (typed) typed = tidy(typed);
   // exact match with the model answer → instant result, no AI call
   if (typed && norm(typed) === norm(s.en)) {
     return { transcript: typed, score: 100, corrected: s.en, natural: s.en, feedback_ja: ['模範解答どおりです。完璧です！'], errors: [], correct_lemmas: (s.w || []).slice() };
@@ -324,6 +331,10 @@ async function grade(s, wav, typed) {
   if (!typed) parts.push({ inlineData: { mimeType: 'audio/wav', data: b64(wav) } });
   const r = await gemini(parts, GRADE_SCHEMA, { temperature: 0.2 });
   r.score = clamp(Math.round(Number(r.score) || 0), 0, 100);
+  // drop "errors" that are only about capitalization or punctuation
+  r.errors = (r.errors || []).filter(e => norm(e.wrong) !== norm(e.right));
+  r.feedback_ja = (r.feedback_ja || []).filter(f => !/(大文字|小文字|ピリオド|句読点|クエスチョンマーク|capital)/i.test(f));
+  if (typed && norm(r.corrected) === norm(typed)) r.corrected = typed;
   return r;
 }
 
@@ -610,7 +621,7 @@ async function submit(audio, typed, passed) {
 function drawResult() {
   const { s, res, wpm, rt, delta, fresh } = P;
   const placementFinished = P.placement && S.placement.i >= PLACEMENT_N;
-  const sameAsCorrected = (res.corrected || '').trim().toLowerCase() === (res.transcript || '').trim().toLowerCase();
+  const sameAsCorrected = norm(res.corrected || '') === norm(res.transcript || '');
   const items = [];
   items.push(`<div class="row"><div class="score ${scoreClass(res.score)}">${res.score}</div><div class="sub">/100</div><span class="spacer"></span>
     <div style="text-align:right" class="sub">${wpm ? `話す速さ <b>${wpm}</b> 語/分<br>` : ''}${rt != null ? `反応 ${rt.toFixed(1)}秒` : ''}${!P.placement && delta ? `<br>レベル ${delta > 0 ? '+' : ''}${delta.toFixed(2)}` : ''}</div></div>`);
@@ -624,7 +635,16 @@ function drawResult() {
   const btns = placementFinished
     ? `<button class="primary full" id="fin">結果を見る</button>`
     : `<div class="row"><button class="primary" style="flex:2" id="next">次へ</button><button style="flex:1" id="retry">もう一度</button></div>`;
-  $('#res').innerHTML = `<div class="card">${items.join('')}</div>${btns}`;
+  const ask = `<div class="card" id="askbox">
+    <div class="lbl" style="margin-top:0">AIに質問</div>
+    <div id="qa"></div>
+    <textarea id="q" placeholder="自由に質問できます" style="min-height:64px;margin-top:8px"></textarea>
+    <p></p><button class="full" id="askbtn">質問する</button>
+  </div>`;
+  $('#res').innerHTML = `<div class="card">${items.join('')}</div>${btns}${ask}`;
+  P.qa = P.qa || [];
+  drawQA();
+  $('#askbtn').onclick = askAI;
   document.querySelectorAll('[data-say]').forEach(b => b.onclick = () => speak(b.dataset.say));
   if (placementFinished) $('#fin').onclick = finishPlacement;
   else {
@@ -632,6 +652,36 @@ function drawResult() {
     $('#retry').onclick = () => { speechSynthesis?.cancel(); P = { s, review: P.review, placement: false, retry: true, shown: Date.now(), state: 'ask' }; drawQuestion(); };
   }
   $('#res').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+// ---------- free questions about the sentence ----------
+function fmt(t) {
+  return esc(t).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/^[*-] /gm, '・').replace(/\n/g, '<br>');
+}
+function drawQA() {
+  const box = $('#qa'); if (!box) return;
+  box.innerHTML = P.qa.map(x => `<div style="margin:10px 0"><div class="sub"><b>Q.</b> ${esc(x.q)}</div>
+    <div style="margin-top:4px">${x.a == null ? '<span class="spin"></span>' : fmt(x.a)}</div></div>`).join('');
+}
+async function askAI() {
+  const q = $('#q').value.trim(); if (!q) return;
+  const { s, res } = P;
+  const item = { q, a: null }; P.qa.push(item); $('#q').value = ''; drawQA();
+  const btn = $('#askbtn'); btn.disabled = true;
+  const history = P.qa.slice(0, -1).map(x => `Q: ${x.q}\nA: ${x.a}`).join('\n\n');
+  const prompt = `あなたは日本人の英語学習者を手伝う、親切で的確な英語の先生です。
+学習者は瞬間英作文の練習中で、次の問題に答えたところです。
+- 日本語のお題：${s.ja}
+- 模範解答：${s.en}
+- 学習者の回答：${res.transcript || '（なし）'}
+- 添削後：${res.corrected}
+- ネイティブ風の言い方：${res.natural}
+${history ? `\nこれまでのやりとり：\n${history}\n` : ''}
+学習者からの質問：${q}
+
+日本語で、短く分かりやすく答えてください（目安200字以内）。単語のニュアンスや使い分けを聞かれたら、短い英語の例文を1〜2個つけてください。大文字・小文字やピリオドの有無は問題にしないでください。`;
+  try { item.a = await gemini([{ text: prompt }], null, { text: true, timeout: 20000 }); }
+  catch (e) { item.a = '⚠ ' + e.message; }
+  btn.disabled = false; drawQA();
 }
 function finishPlacement() {
   const r = Math.round(S.placement.r * 10) / 10;

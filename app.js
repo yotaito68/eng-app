@@ -8,7 +8,7 @@ const WORDSET = new Set(WORDS2000);
 const PLACEMENT_N = 12;
 const DAY = 86400000;
 const REVIEW_INTERVALS = [1, 3, 7, 14, 30]; // days
-const FALLBACK_MODELS = ['gemini-flash-latest', 'gemini-3.5-flash', 'gemini-2.5-flash', 'gemini-flash-lite-latest'];
+const FALLBACK_MODELS = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-flash-lite-latest', 'gemini-3.5-flash', 'gemini-flash-latest'];
 const LEVEL_DESC = {
   1:'3〜5語のごく短い文（挨拶・現在形）', 2:'5〜7語の基本文（現在・過去）', 3:'依頼・許可・疑問文（can, could, may）',
   4:'未来・比較・頻度など7〜9語', 5:'現在完了・if・because を含む8〜11語', 6:'句動詞・受動態・9〜12語',
@@ -20,7 +20,7 @@ const LEVEL_DESC = {
 function defaultState() {
   return {
     v: 1,
-    settings: { apiKey: '', model: '', models: [], reviewStreak: 2, scenes: [], autoSpeak: true, inputMode: 'voice' },
+    settings: { apiKey: '', model: '', modelPinned: false, speed: 'fast', models: [], reviewStreak: 2, scenes: [], autoSpeak: true, inputMode: 'voice' },
     rating: null, ratingHist: [], placement: null,
     active: {},          // lemma -> {t: firstTs, n: count}
     items: {},           // id -> {n, t, s, st, due, rev}
@@ -215,42 +215,67 @@ async function listModels(key) {
   const names = (d.models || []).filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
     .map(m => m.name.replace(/^models\//, ''))
     .filter(n => /flash/.test(n) && !/(image|tts|live|audio|embed|thinking|exp|translate|transcribe|omni|computer|robotics)/.test(n));
-  const ver = n => { const m = n.match(/gemini-(\d+(?:\.\d+)?)/); return m ? parseFloat(m[1]) : 0; };
-  const rank = n => ver(n) * 10 - (/lite/.test(n) ? 3 : 0) - (/preview/.test(n) ? 2 : 0) - (/-\d{2,}/.test(n.replace(/gemini-\d+(\.\d+)?/, '')) ? 1 : 0) + (/latest/.test(n) ? -0.5 : 0);
-  return [...new Set(names)].sort((a, b) => rank(b) - rank(a));
+  return [...new Set(names)];
 }
 async function errText(r) {
   try { const j = await r.json(); return j.error?.message || r.statusText; } catch (e) { return r.statusText; }
 }
+// Model order. "fast" (default) puts the lightweight Flash-Lite models first: they answer in 1-3 s.
 function modelOrder() {
-  const list = [S.settings.model, ...(S.settings.models || []), ...FALLBACK_MODELS].filter(Boolean);
-  return [...new Set(list)];
+  const st = S.settings, fast = st.speed !== 'quality';
+  const ver = n => { const m = n.match(/gemini-(\d+(?:\.\d+)?)/); return m ? parseFloat(m[1]) : (/latest/.test(n) ? 3 : 0); };
+  const rank = n => (/lite/.test(n) === fast ? 100 : 0) + ver(n) * 10 - (/preview/.test(n) ? 4 : 0) - (/-\d{2,}$/.test(n) ? 1 : 0) - (/latest/.test(n) ? 0.5 : 0);
+  const all = [...new Set([...(st.models || []), ...FALLBACK_MODELS])].sort((a, b) => rank(b) - rank(a));
+  // interleave: best preferred model, then best of the other family as a backup, then the rest
+  const pref = all.filter(n => /lite/.test(n) === fast), other = all.filter(n => /lite/.test(n) !== fast);
+  const base = [];
+  for (let i = 0; i < Math.max(pref.length, other.length); i++) { if (pref[i]) base.push(pref[i]); if (other[i]) base.push(other[i]); }
+  return [...new Set([st.modelPinned ? st.model : null, ...base].filter(Boolean))];
 }
-async function gemini(parts, schema, temperature = 0.2) {
-  const key = S.settings.apiKey;
+let curCtl = null; // lets the "やめる" button abort the request in flight
+function cancelRequest() { if (curCtl) { curCtl.userCancel = true; curCtl.abort(); } }
+async function gemini(parts, schema, opt = {}) {
+  const key = S.settings.apiKey, fast = S.settings.speed !== 'quality';
   if (!key) throw new ApiError('APIキーが未設定です。設定タブで入力してください。', 0);
+  const timeout = opt.timeout || (fast ? 10000 : 25000);
   let lastErr;
-  for (const model of modelOrder().slice(0, 4)) {
-    for (const withThinking of (/gemini-[3-9]/.test(model) ? [true, false] : [false])) {
-      const gc = { responseMimeType: 'application/json', responseSchema: schema, temperature };
-      if (withThinking) gc.thinkingConfig = { thinkingLevel: 'low' };
+  for (const model of modelOrder().slice(0, 3)) {
+    const g3 = !/gemini-[12]\./.test(model);
+    // minimal thinking = fastest answer; retry without the setting if a model rejects it
+    for (const withThinking of [true, false]) {
+      const gc = { responseMimeType: 'application/json', responseSchema: schema };
+      if (!g3 && opt.temperature != null) gc.temperature = opt.temperature;
+      if (withThinking) gc.thinkingConfig = g3 ? { thinkingLevel: fast ? 'minimal' : 'low' } : { thinkingBudget: 0 };
+      const ctl = new AbortController(); curCtl = ctl;
+      const timer = setTimeout(() => ctl.abort(), timeout);
       let r;
       try {
         r = await fetch(`${API}/models/${model}:generateContent`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, signal: ctl.signal,
           body: JSON.stringify({ contents: [{ role: 'user', parts }], generationConfig: gc })
         });
-      } catch (e) { throw new ApiError('通信できませんでした。電波の状態を確認してください。', 0); }
+      } catch (e) {
+        clearTimeout(timer);
+        if (ctl.userCancel) throw new ApiError('中止しました', -1);
+        if (e.name === 'AbortError') { lastErr = new ApiError('AIの応答に時間がかかりすぎました。', 408); break; } // try next model
+        throw new ApiError('通信できませんでした。電波の状態を確認してください。', 0);
+      }
+      let d;
+      try { d = r.ok ? await r.json() : null; } catch (e) {
+        clearTimeout(timer);
+        if (ctl.userCancel) throw new ApiError('中止しました', -1);
+        lastErr = new ApiError('AIの応答に時間がかかりすぎました。', 408); break;
+      }
+      clearTimeout(timer);
       if (r.ok) {
-        const d = await r.json();
         const text = (d.candidates?.[0]?.content?.parts || []).filter(p => p.text && !p.thought).map(p => p.text).join('');
         if (!text) { lastErr = new ApiError('AIから空の応答が返りました。もう一度試してください。', 200); break; }
-        if (S.settings.model !== model) { S.settings.model = model; save(); }
+        if (!S.settings.modelPinned && S.settings.model !== model) { S.settings.model = model; save(); }
         return JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, ''));
       }
       const msg = await errText(r);
       lastErr = new ApiError(msg, r.status);
-      if (r.status === 400 && withThinking && /thinking/i.test(msg)) continue; // retry without thinking
+      if (r.status === 400 && withThinking && /think/i.test(msg)) continue;
       if (r.status === 400 && /API key/i.test(msg)) throw new ApiError('APIキーが正しくないようです。設定を確認してください。', 400);
       if (r.status === 401 || r.status === 403) throw new ApiError('APIキーが使えません（' + msg + '）', r.status);
       break; // 404/429/5xx → try next model
@@ -279,20 +304,25 @@ Japanese prompt: ${s.ja}
 Reference translation (one of many acceptable answers): ${s.en}
 The learner's answer is ${typed ? `this typed text: """${typed}"""` : 'in the attached audio recording.'}
 
-Do the following and reply in JSON:
+Be brief — speed matters. Reply in JSON:
 1. transcript: ${typed ? 'copy the learner\'s text as is.' : 'transcribe exactly what the learner said in English, verbatim, keeping their mistakes. Do NOT correct anything. If the audio is silent or unintelligible, return an empty string.'}
 2. score (0-100): how accurately and naturally the answer expresses the meaning of the Japanese prompt. There are many correct answers — do not penalize wording that differs from the reference if it is natural and accurate. Ignore capitalization and punctuation${typed ? '' : ', and ignore pronunciation unless a word is unintelligible'}.
    95-100: natural and accurate. 80-94: correct meaning, minor awkwardness. 60-79: understandable but with grammar mistakes or missing nuance. 30-59: major errors or part of the meaning missing. 0-29: wrong or no answer.
 3. corrected: the learner's answer with the minimum changes needed to be correct and natural (same as transcript if already fine; reference translation if the answer is empty).
 4. natural: the most natural thing a native speaker would say in this situation.
-5. feedback_ja: 1-3 short, concrete points in polite Japanese (です・ます). Point out what to fix and why; if the answer is good, say what was good. Do not repeat the score.
-6. errors: each mistake as {wrong, right, why_ja}. Empty array if none.
+5. feedback_ja: at most 2 very short points in polite Japanese (です・ます, under 40 characters each). What to fix and why, or what was good.
+6. errors: up to 3 mistakes as {wrong, right, why_ja (under 30 Japanese characters)}. Empty array if none.
 7. correct_lemmas: lowercase dictionary forms (e.g. went→go, children→child) of the English words the learner used correctly in their answer. Exclude words used incorrectly.`;
 }
+const norm = t => String(t).toLowerCase().replace(/[’']/g, "'").replace(/[^a-z0-9' ]+/g, ' ').replace(/\s+/g, ' ').trim();
 async function grade(s, wav, typed) {
+  // exact match with the model answer → instant result, no AI call
+  if (typed && norm(typed) === norm(s.en)) {
+    return { transcript: typed, score: 100, corrected: s.en, natural: s.en, feedback_ja: ['模範解答どおりです。完璧です！'], errors: [], correct_lemmas: (s.w || []).slice() };
+  }
   const parts = [{ text: gradePrompt(s, typed) }];
   if (!typed) parts.push({ inlineData: { mimeType: 'audio/wav', data: b64(wav) } });
-  const r = await gemini(parts, GRADE_SCHEMA, 0.2);
+  const r = await gemini(parts, GRADE_SCHEMA, { temperature: 0.2 });
   r.score = clamp(Math.round(Number(r.score) || 0), 0, 100);
   return r;
 }
@@ -315,7 +345,7 @@ Rules:
 - Where it fits naturally, use some of these words the learner has not used yet: ${sample.join(', ')}.
 - w: lowercase dictionary forms of all English words in en.
 - Do not repeat these existing sentences: ${avoid}`;
-  const arr = await gemini([{ text: prompt }], GEN_SCHEMA, 0.9);
+  const arr = await gemini([{ text: prompt }], GEN_SCHEMA, { temperature: 0.9, timeout: 40000 });
   const ts = Date.now().toString(36);
   const out = (Array.isArray(arr) ? arr : []).filter(x => x && x.ja && x.en).map((x, i) => ({
     id: `g${ts}${i}`, lv: level, sc: SCENES.includes(x.sc) ? x.sc : scenes[i % scenes.length], ja: x.ja, en: x.en,
@@ -392,7 +422,7 @@ function renderSetup() {
     $('#msg').innerHTML = '<span class="spin"></span> 確認中…';
     try {
       const models = await listModels(key);
-      S.settings.apiKey = key; S.settings.models = models; S.settings.model = models[0] || FALLBACK_MODELS[0];
+      S.settings.apiKey = key; S.settings.models = models; S.settings.model = ''; S.settings.modelPinned = false;
       save();
       document.querySelectorAll('#tabs button').forEach(b => b.disabled = false);
       toast('設定しました');
@@ -463,7 +493,14 @@ function drawQuestion() {
 }
 function drawAnswerArea(mode) {
   const box = $('#ans');
-  if (P.state === 'busy') { box.innerHTML = `<div class="center" style="padding:20px"><span class="spin"></span><p class="sub">採点中…</p></div>`; return; }
+  if (P.state === 'busy') {
+    box.innerHTML = `<div class="center" style="padding:20px"><span class="spin"></span><p class="sub">採点中… <span class="timer" id="bt">0.0秒</span></p><button class="ghost" id="cancel">やめる</button></div>`;
+    const t0 = Date.now();
+    clearInterval(drawAnswerArea._t);
+    drawAnswerArea._t = setInterval(() => { const e = $('#bt'); if (!e || P.state !== 'busy') return clearInterval(drawAnswerArea._t); e.textContent = ((Date.now() - t0) / 1000).toFixed(1) + '秒'; }, 100);
+    $('#cancel').onclick = cancelRequest;
+    return;
+  }
   if (P.state === 'done') { box.innerHTML = ''; return; }
   if (mode === 'voice') {
     box.innerHTML = `
@@ -677,9 +714,12 @@ function renderSettings() {
   <div class="card">
     <label>Gemini APIキー</label>
     <input id="key" type="password" value="${esc(st.apiKey)}" autocomplete="off">
+    <label>採点の速さ</label>
+    <div class="seg" id="speed"><button data-s="fast" class="${st.speed !== 'quality' ? 'on' : ''}">速さ優先</button><button data-s="quality" class="${st.speed === 'quality' ? 'on' : ''}">丁寧さ優先</button></div>
+    <p class="sub">速さ優先：軽量モデルで素早く採点。丁寧さ優先：高性能モデルでじっくり採点（時間がかかります）。</p>
     <label>AIモデル</label>
-    <div class="row"><select id="model">${models.map(m => `<option ${m === st.model ? 'selected' : ''}>${esc(m)}</option>`).join('')}</select><button id="refresh" title="一覧を更新">↻</button></div>
-    <p class="sub">上限に達したときは自動で別のモデルに切り替えます。</p>
+    <div class="row"><select id="model"><option value="">自動（おすすめ）${!st.modelPinned && st.model ? '：' + esc(st.model) : ''}</option>${models.map(m => `<option value="${esc(m)}" ${st.modelPinned && m === st.model ? 'selected' : ''}>${esc(m)}</option>`).join('')}</select><button id="refresh" title="一覧を更新">↻</button></div>
+    <p class="sub">反応しないときや上限に達したときは、自動で別のモデルに切り替えます。</p>
     <button class="full" id="test">接続テスト</button><p id="tmsg" class="sub"></p>
   </div>
   <div class="card">
@@ -702,16 +742,18 @@ function renderSettings() {
   </div>
   <p class="sub center">データはこの端末内（とGoogleのAI）以外には送られません。</p>`;
   $('#key').onchange = e => { st.apiKey = e.target.value.trim(); save(); };
-  $('#model').onchange = e => { st.model = e.target.value; save(); };
+  $('#model').onchange = e => { st.model = e.target.value; st.modelPinned = !!e.target.value; save(); };
+  document.querySelectorAll('#speed button').forEach(bt => bt.onclick = () => { st.speed = bt.dataset.s; if (!st.modelPinned) st.model = ''; save(); renderSettings(); });
   $('#refresh').onclick = async () => {
-    try { st.models = await listModels(st.apiKey); if (!st.models.includes(st.model)) st.model = st.models[0]; save(); renderSettings(); toast('モデル一覧を更新しました'); }
+    try { st.models = await listModels(st.apiKey); if (st.modelPinned && !st.models.includes(st.model)) { st.model = ''; st.modelPinned = false; } save(); renderSettings(); toast('モデル一覧を更新しました'); }
     catch (e) { toast(e.message, 4000); }
   };
   $('#test').onclick = async () => {
     $('#tmsg').innerHTML = '<span class="spin"></span>';
+    const t0 = performance.now();
     try {
       const r = await gemini([{ text: 'Reply with JSON {"ok": true}' }], { type: 'OBJECT', properties: { ok: { type: 'BOOLEAN' } }, required: ['ok'] });
-      $('#tmsg').textContent = r.ok ? `OK（${st.model}）` : '応答が想定外でした';
+      $('#tmsg').textContent = r.ok ? `OK（${st.model}・${((performance.now() - t0) / 1000).toFixed(1)}秒）` : '応答が想定外でした';
     } catch (e) { $('#tmsg').textContent = e.message; }
   };
   document.querySelectorAll('.check input').forEach(c => c.onchange = () => {

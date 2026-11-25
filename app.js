@@ -218,8 +218,16 @@ async function listModels(key) {
     .filter(n => /flash/.test(n) && !/(image|tts|live|audio|embed|thinking|exp|translate|transcribe|omni|computer|robotics)/.test(n));
   return [...new Set(names)];
 }
-async function errText(r) {
-  try { const j = await r.json(); return j.error?.message || r.statusText; } catch (e) { return r.statusText; }
+async function errText(r) { return (await errInfo(r)).msg; }
+// message + whether a 429 is the per-minute or the per-day limit + suggested wait
+async function errInfo(r) {
+  try {
+    const j = await r.json(), e = j.error || {}, det = JSON.stringify(e.details || []);
+    const retry = parseFloat((det.match(/"retryDelay":"([\d.]+)s"/) || [])[1]) || null;
+    const perDay = /PerDay|per_day|requests_per_day/i.test(det + e.message);
+    const perMin = /PerMinute|per_minute/i.test(det + e.message);
+    return { msg: e.message || r.statusText, retry, perDay, perMin };
+  } catch (x) { return { msg: r.statusText }; }
 }
 // Model order. "fast" (default) puts the lightweight Flash-Lite models first: they answer in 1-3 s.
 function modelOrder() {
@@ -229,10 +237,15 @@ function modelOrder() {
   const all = [...new Set([...(st.models || []), ...FALLBACK_MODELS])].sort((a, b) => rank(b) - rank(a));
   // interleave: best preferred model, then best of the other family as a backup, then the rest
   const pref = all.filter(n => /lite/.test(n) === fast), other = all.filter(n => /lite/.test(n) !== fast);
-  const base = [];
-  for (let i = 0; i < Math.max(pref.length, other.length); i++) { if (pref[i]) base.push(pref[i]); if (other[i]) base.push(other[i]); }
-  return [...new Set([st.modelPinned ? st.model : null, ...base].filter(Boolean))];
+  const out = usage().out;
+  const base = [...pref, ...other].filter(n => !out[n]);
+  return [...new Set([st.modelPinned && !out[st.model] ? st.model : null, ...base].filter(Boolean))];
 }
+// Free-tier quotas reset at midnight Pacific time (17:00 or 16:00 in Japan)
+function ptDay() { return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' }); }
+function usage() { const d = ptDay(); if (!S.usage || S.usage.d !== d) S.usage = { d, n: {}, out: {} }; return S.usage; }
+function countUse(model) { const u = usage(); u.n[model] = (u.n[model] || 0) + 1; }
+function markOut(model) { usage().out[model] = true; save(); }
 let curCtl = null; // lets the "やめる" button abort the request in flight
 function cancelRequest() { if (curCtl) { curCtl.userCancel = true; curCtl.abort(); } }
 async function gemini(parts, schema, opt = {}) {
@@ -240,7 +253,10 @@ async function gemini(parts, schema, opt = {}) {
   if (!key) throw new ApiError('APIキーが未設定です。設定タブで入力してください。', 0);
   const timeout = opt.timeout || (fast ? 10000 : 25000);
   let lastErr;
-  for (const model of modelOrder().slice(0, opt.tries || 2)) {
+  const order = modelOrder();
+  if (!order.length) throw new ApiError('今日の無料枠をすべて使い切りました。日本時間の17時ごろ（夏は16時ごろ）に回復します。', 429);
+  let minuteWait = false;
+  for (const model of order.slice(0, opt.tries || 3)) {
     const g3 = !/gemini-[12]\./.test(model);
     // minimal thinking = fastest answer; retry without the setting if a model rejects it
     for (const withThinking of [true, false]) {
@@ -270,13 +286,21 @@ async function gemini(parts, schema, opt = {}) {
       }
       clearTimeout(timer);
       if (r.ok) {
+        countUse(model);
         const text = (d.candidates?.[0]?.content?.parts || []).filter(p => p.text && !p.thought).map(p => p.text).join('');
         if (!text) { lastErr = new ApiError('AIから空の応答が返りました。もう一度試してください。', 200); break; }
         if (!S.settings.modelPinned && S.settings.model !== model) { S.settings.model = model; save(); }
         return opt.text ? text : JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, ''));
       }
-      const msg = await errText(r);
+      const info = await errInfo(r), msg = info.msg;
       lastErr = new ApiError(msg, r.status);
+      if (r.status === 429) {
+        if (info.perDay && !info.perMin) { markOut(model); break; }             // used up for today → next model
+        if (info.retry && info.retry <= 20 && !minuteWait) {                     // per-minute limit → wait and retry once
+          minuteWait = true; await new Promise(ok => setTimeout(ok, info.retry * 1000 + 300)); continue;
+        }
+        lastErr.perMin = true; break;
+      }
       if (r.status === 400 && withThinking && /think/i.test(msg)) continue;
       if (r.status === 400 && /API key/i.test(msg)) throw new ApiError('APIキーが正しくないようです。設定を確認してください。', 400);
       if (r.status === 401 || r.status === 403) throw new ApiError('APIキーが使えません（' + msg + '）', r.status);
@@ -284,7 +308,10 @@ async function gemini(parts, schema, opt = {}) {
     }
   }
   if (lastErr && (lastErr.status === 408 || lastErr.status === 0)) throw new ApiError(lastErr.message + 'もう一度「再送信」を押してください。続く場合は設定の「接続テスト」を試してください。', lastErr.status);
-  if (lastErr?.status === 429) throw new ApiError('今日の無料枠の上限に達したようです。少し時間をおくか、明日（日本時間の夕方以降）に再開してください。', 429);
+  if (lastErr?.status === 429) {
+    if (lastErr.perMin) throw new ApiError('短時間に使いすぎたため一時的に止まっています。30秒ほど待ってから再送信してください。', 429);
+    throw new ApiError('今日の無料枠をすべて使い切りました。日本時間の17時ごろ（夏は16時ごろ）に回復します。', 429);
+  }
   throw lastErr || new ApiError('AIの呼び出しに失敗しました', 0);
 }
 
@@ -971,6 +998,9 @@ function renderSettings() {
     <div class="row"><select id="model"><option value="">自動（おすすめ）${!st.modelPinned && st.model ? '：' + esc(st.model) : ''}</option>${models.map(m => `<option value="${esc(m)}" ${st.modelPinned && m === st.model ? 'selected' : ''}>${esc(m)}</option>`).join('')}</select><button id="refresh" title="一覧を更新">↻</button></div>
     <p class="sub">反応しないときや上限に達したときは、自動で別のモデルに切り替えます。</p>
     <button class="full" id="test">接続テスト</button><p id="tmsg" class="sub"></p>
+    <label>今日のAI利用回数</label>
+    <div class="sub">${(() => { const u = usage(), ks = Object.keys(u.n); return ks.length ? ks.map(k => `${esc(k)}：${u.n[k]}回${u.out[k] ? '（上限に到達）' : ''}`).join('<br>') : 'まだありません'; })()}</div>
+    <p class="sub">無料枠の目安：Flash-Lite系は1モデルにつき1日約500回、Flash系は1日約20回。日本時間17時ごろ（夏は16時ごろ）にリセットされます。</p>
   </div>
   <div class="card">
     <label>復習から外すまでの連続正解数</label>
